@@ -1,0 +1,32 @@
+const mongoose = require("mongoose");
+
+const photoSchema = new mongoose.Schema({
+    cloudinaryUrl: String,
+    publicId: String,
+    eventId: String,
+    detectedFaces: [
+        {
+            descriptor: [Number],
+            box: {
+                x: Number,
+                y: Number,
+                width: Number,
+                height: Number
+            }
+        }
+    ],
+    processed: {
+        type: Boolean,
+        default: false,
+    },
+    createdAt: {
+        type: Date,
+        default: Date.now,
+    },
+});
+
+// Matching pipeline query: "find all unprocessed photos for this event".
+// Without this index every matching run scans the entire photos collection.
+photoSchema.index({ eventId: 1, processed: 1 });
+
+module.exports = mongoose.model("Photo", photoSchema);
