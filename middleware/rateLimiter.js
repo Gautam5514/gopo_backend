@@ -38,13 +38,12 @@ const authLimiter = rateLimit({
 
 // ─── Tier 3 — Photo upload / heavy compute ────────────────────────────────────
 // Applied to POST /api/admin/upload-photos.
-// Each request can carry up to 50 images; every image runs TensorFlow face
-// detection + descriptor extraction on the CPU. A single IP flooding this
-// endpoint would pin the server and make it unresponsive for all real users.
-// 10 upload batches per minute per IP is ample for any legitimate admin session.
+// The frontend splits large uploads into 30-photo batches, so a single 300-photo
+// session makes ~10 requests. Limit raised to 30/min so fast connections never
+// hit the ceiling mid-session while still blocking scripted floods.
 const uploadLimiter = rateLimit({
   windowMs: 60 * 1000,
-  limit: 10,
+  limit: 30,
   standardHeaders: "draft-7",
   legacyHeaders: false,
   message: msg(
@@ -70,14 +69,20 @@ const paymentLimiter = rateLimit({
 
 // ─── Tier 5 — Guest registration ─────────────────────────────────────────────
 // Applied to POST /api/guests/register.
-// Each registration: uploads a selfie to Cloudinary, runs face extraction, writes
-// a DB record, and sends a Resend onboarding email — all billable operations.
-// Limit is set high (50 / 15 min) to accommodate event venues where hundreds of
-// real guests may share the same NAT / Wi-Fi IP. Still blocks automated bulk
-// registration scripts that would exhaust email quotas and storage.
+// Each registration: runs ONNX face extraction, uploads a selfie to Cloudinary,
+// writes a DB record, and sends a Resend onboarding email — all billable operations.
+//
+// Limit is 300 / 15 min to accommodate event venues where all guests share the
+// same public IP (NAT / venue Wi-Fi).  A 1000-guest wedding with guests scanning
+// QR codes over 30–45 minutes = ~30 registrations/min sustained from one IP;
+// 300 gives comfortable headroom without allowing automated bulk scripts.
+//
+// The face detection pipeline itself is a natural throttle: a single CPU core
+// can process ~2 selfies/min, so 300 registrations in 15 min from one server
+// is already physically impossible — this limit only blocks truly automated abuse.
 const guestRegistrationLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  limit: 50,
+  limit: 300,
   standardHeaders: "draft-7",
   legacyHeaders: false,
   message: msg(

@@ -29,22 +29,62 @@ const assertCloudinaryConfig = () => {
     cloudinary.config(cloudinaryConfig);
 };
 
+// Hard limit so a hung Cloudinary connection never pins a job worker
+// for the full 8-minute job timeout.  120 s is generous for even a
+// large compressed photo on a slow uplink; failed uploads are retried
+// automatically by the job runner (up to 3 attempts).
+const UPLOAD_TIMEOUT_MS = 120_000;
+
 exports.uploadImage = async (fileBuffer, folder = "event_photos") => {
     assertCloudinaryConfig();
     return new Promise((resolve, reject) => {
-        cloudinary.uploader.upload_stream(
-            { folder },
+        let settled = false;
+
+        const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            reject(new Error(`Cloudinary upload timed out after ${UPLOAD_TIMEOUT_MS / 1000}s`));
+        }, UPLOAD_TIMEOUT_MS);
+
+        const stream = cloudinary.uploader.upload_stream(
+            { folder, timeout: UPLOAD_TIMEOUT_MS },
             (error, result) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
                 if (error) return reject(error);
                 resolve(result);
             }
-        ).end(fileBuffer);
+        );
+
+        stream.on("error", (err) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            reject(err);
+        });
+
+        stream.end(fileBuffer);
     });
 };
 
+// 30 s — matches the upload timeout pattern already used by uploadImage.
+// Without a timeout, a Cloudinary partial outage causes deleteImage to hang
+// indefinitely, blocking the user-facing DELETE /api/guests/me endpoint and
+// the cleanup scheduler.
+const DELETE_TIMEOUT_MS = 30_000;
+
 exports.deleteImage = async (publicId) => {
     assertCloudinaryConfig();
-    return await cloudinary.uploader.destroy(publicId);
+    return await Promise.race([
+        cloudinary.uploader.destroy(publicId),
+        new Promise((_, reject) =>
+            setTimeout(
+                () => reject(new Error(`Cloudinary delete timed out after ${DELETE_TIMEOUT_MS / 1000}s`)),
+                DELETE_TIMEOUT_MS
+            )
+        ),
+    ]);
 };
 
 exports.extractPublicIdFromUrl = (url) => {

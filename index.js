@@ -1,11 +1,8 @@
-// ===============================
-// LOAD ENV + IMPORTS
-// ===============================
+
 const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, ".env"), override: true });
 
-// Sentry must be initialised before any other require so it can wrap
-// third-party modules (mongoose, http) for automatic instrumentation.
+
 const { Sentry, init: initSentry } = require("./config/sentry");
 initSentry();
 
@@ -19,9 +16,7 @@ const { globalLimiter } = require("./middleware/rateLimiter");
 const { startJobRunner, stopJobRunner } = require("./workers/jobRunner");
 
 
-// ===============================
-// APP INIT
-// ===============================
+
 const app = express();
 
 // When deployed behind Nginx, Railway, Render, or any reverse proxy, req.ip
@@ -30,15 +25,11 @@ const app = express();
 app.set("trust proxy", 1);
 
 
-// ===============================
-// DATABASE CONNECTION
-// ===============================
+
 mongoose.set("bufferCommands", false);
 
 
-// ===============================
-// GLOBAL MIDDLEWARE
-// ===============================
+
 const allowedOrigins = (process.env.CORS_ORIGINS || "http://localhost:3000")
   .split(",")
   .map((origin) => origin.trim())
@@ -72,12 +63,7 @@ const requireDatabaseConnection = (req, res, next) => {
 };
 
 
-// ===============================
-// ROUTES
-// ===============================
-// Global rate limiter runs before every /api route — cheap in-memory check
-// that drops excess requests before they reach the DB or any controller.
-// The Razorpay webhook path is skipped inside the limiter itself.
+
 app.use("/api", globalLimiter);
 // Contact route only needs Resend (no DB), so register before requireDatabaseConnection.
 app.use("/api/contact", require("./routes/contactRoutes"));
@@ -89,34 +75,23 @@ app.use("/api/billing", require("./routes/billingRoutes"));
 app.use("/api/superadmin", require("./routes/superadminRoutes"));
 
 
-// ===============================
-// HEALTH CHECK
-// ===============================
+
 app.get("/", (req, res) => {
   res.send("🚀 API Running");
 });
 
 
-// ===============================
-// SENTRY ERROR HANDLER
-// ===============================
-// Must be registered AFTER all routes and BEFORE the custom error handler.
-// Sentry captures every error passed to next(err) and every unhandled
-// exception, attaches the request context, and forwards to the next handler.
+
 Sentry.setupExpressErrorHandler(app);
 
 
-// ===============================
-// 404 NOT FOUND
-// ===============================
+
 app.use((req, res) => {
   res.status(404).json({ message: "Route not found" });
 });
 
 
-// ===============================
-// GLOBAL ERROR HANDLER
-// ===============================
+
 app.use((err, req, res, next) => {
   // Sentry has already captured the error above; just log + respond.
   console.error(err.stack);
@@ -124,16 +99,29 @@ app.use((err, req, res, next) => {
 });
 
 
-// ===============================
-// START SERVER
-// ===============================
 const PORT = process.env.PORT || 5000;
 
 let server;
 
 const startServer = async () => {
   try {
-    await mongoose.connect(process.env.MONGO_URI);
+    await mongoose.connect(process.env.MONGO_URI, {
+      // Fail fast if the Atlas cluster is unreachable at startup
+      serverSelectionTimeoutMS: 10_000,
+      // Keep the TCP socket alive so Atlas's monitor connection
+      // doesn't get silently dropped after the long ONNX inference pauses.
+      socketTimeoutMS:          90_000,
+      // Ping the primary every 10 s so we detect failovers quickly.
+      heartbeatFrequencyMS:     10_000,
+      // Allow Mongoose to retry a failed write once after a transient error.
+      retryWrites:              true,
+      retryReads:               true,
+      // 15 connections covers: job worker (2), matching pipeline (3), and
+      // ~10 concurrent HTTP requests (gallery loads, downloads, registrations).
+      // Atlas M0 (free) supports up to ~100 simultaneous connections total.
+      maxPoolSize:              15,
+      minPoolSize:              2,
+    });
     console.log("✅ MongoDB Connected");
   } catch (err) {
     console.error("❌ MongoDB Error:", err.message);

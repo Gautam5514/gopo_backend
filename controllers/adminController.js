@@ -4,9 +4,10 @@ const Guest = require("../models/Guest");
 const Match = require("../models/Match");
 const DownloadLog = require("../models/DownloadLog");
 const Event = require("../models/Event");
+const Job = require("../models/Job");
 const { assertUploadAllowed, incrementUsage } = require("../services/billingService");
-const { runMatchingForEvent } = require("../services/matchService");
-const { getPhotoQueue } = require("../queues/photoQueue");
+const { triggerMatchingForEvent } = require("../services/matchService");
+const { enqueuePhotos } = require("../queues/photoQueue");
 
 const getOwnedEvents = (adminId) => Event.find({ ownerId: adminId });
 
@@ -32,32 +33,59 @@ exports.uploadPhotos = async (req, res) => {
 
         const billing = await assertUploadAllowed(req.user.userId, files.length);
 
+        // Remove any photos from a previous batch that failed all 3 job
+        // attempts.  Their temp files are gone and they will never gain face
+        // data, so keeping them pollutes the DB and makes matching skip them
+        // forever.  Job documents for these photos are harmless — their next
+        // attempt finds no Photo record and exits cleanly.
+        const { deletedCount: cleanedUp } = await Photo.deleteMany({
+            eventId,
+            cloudinaryUrl: "upload_failed",
+        });
+        if (cleanedUp > 0) {
+            console.log(`[Upload] Removed ${cleanedUp} previously-failed photo(s) for event ${eventId}`);
+        }
+
         // Create Photo records immediately (no face data yet) and queue one
         // face_detection job per photo. The job runner processes them in the
         // background: detects faces, uploads to Cloudinary, then triggers
         // matching once all photos in this event are processed.
-        const photos = await Promise.all(
-            files.map(() =>
-                Photo.create({
-                    cloudinaryUrl: null,
-                    publicId: null,
-                    eventId,
-                    detectedFaces: [],
-                    processed: false,
-                })
-            )
-        );
+        //
+        // If Photo.create partially fails (MongoDB write error after N inserts),
+        // or if enqueuePhotos fails after all Photo docs are created, we delete
+        // every Photo document that was successfully inserted.  Without this
+        // cleanup those docs stay with cloudinaryUrl=null and block matching for
+        // the entire event indefinitely.
+        let photos = [];
+        try {
+            photos = await Promise.all(
+                files.map(() =>
+                    Photo.create({
+                        cloudinaryUrl: null,
+                        publicId: null,
+                        eventId,
+                        detectedFaces: [],
+                        processed: false,
+                    })
+                )
+            );
 
-        await getPhotoQueue().addBulk(
-            files.map((file, i) => ({
-                name: "face_detection",
-                data: {
+            await enqueuePhotos(
+                files.map((file, i) => ({
                     photoId: photos[i]._id.toString(),
                     tempPath: file.path,
                     eventId,
-                },
-            }))
-        );
+                }))
+            );
+        } catch (createErr) {
+            if (photos.length > 0) {
+                const ids = photos.map((p) => p._id);
+                Photo.deleteMany({ _id: { $in: ids } }).catch((delErr) =>
+                    console.error("[Upload] Orphan cleanup failed:", delErr.message)
+                );
+            }
+            throw createErr;
+        }
 
         const updatedUsage = await incrementUsage(
             req.user.userId,
@@ -98,7 +126,19 @@ exports.startMatching = async (req, res) => {
             return res.status(404).json({ error: "Event not found" });
         }
 
-        const result = await runMatchingForEvent(eventId, { requireGuests: true });
+        const result = await triggerMatchingForEvent(eventId, {
+            requireGuests: true,
+            resetProcessed: true,
+        });
+
+        if (result.skipped) {
+            return res.status(409).json({
+                error: result.reason === "photos_still_processing"
+                    ? "Photos are still processing. Matching will run automatically when uploads finish."
+                    : "Matching is already running for this event.",
+                ...result,
+            });
+        }
 
         res.json({
             success: true,
@@ -127,12 +167,14 @@ exports.getDownloadStats = async (req, res) => {
         }
 
         const now = new Date();
+        // Use UTC throughout so the date boundaries and the ISO string in the
+        // response are consistent regardless of the server's local timezone.
         const startOfDay = new Date(now);
-        startOfDay.setHours(0, 0, 0, 0);
+        startOfDay.setUTCHours(0, 0, 0, 0);
         const endOfDay = new Date(startOfDay);
-        endOfDay.setDate(endOfDay.getDate() + 1);
+        endOfDay.setUTCDate(endOfDay.getUTCDate() + 1);
         const start7Days = new Date(startOfDay);
-        start7Days.setDate(start7Days.getDate() - 6);
+        start7Days.setUTCDate(startOfDay.getUTCDate() - 6);
 
         const todayDownloads = await DownloadLog.countDocuments({
             eventId,
@@ -158,7 +200,7 @@ exports.getDownloadStats = async (req, res) => {
             {
                 $group: {
                     _id: {
-                        $dateToString: { format: "%Y-%m-%d", date: "$downloadedAt" },
+                        $dateToString: { format: "%Y-%m-%d", date: "$downloadedAt", timezone: "UTC" },
                     },
                     count: { $sum: 1 },
                 },
@@ -170,7 +212,7 @@ exports.getDownloadStats = async (req, res) => {
         const last7Days = [];
         for (let i = 0; i < 7; i++) {
             const d = new Date(start7Days);
-            d.setDate(start7Days.getDate() + i);
+            d.setUTCDate(start7Days.getUTCDate() + i);
             const key = d.toISOString().slice(0, 10);
             last7Days.push({ date: key, count: trendMap.get(key) || 0 });
         }
@@ -306,10 +348,25 @@ exports.getEventById = async (req, res) => {
         const guestIds = guests.map((g) => g._id);
         const matchCount = await Match.countDocuments({ guestId: { $in: guestIds } });
 
-        // Count photos still being processed by the job runner.
+        // Photos still waiting to be picked up by the worker (cloudinaryUrl: null).
         const pendingProcessing = await Photo.countDocuments({
             eventId: event.code,
             cloudinaryUrl: null,
+        });
+
+        // Jobs actively being processed right now (status = "processing").
+        // Helps distinguish "queued but not started" from "worker is on it".
+        const activeJobs = await Job.countDocuments({
+            "payload.eventId": event.code,
+            status: "processing",
+        });
+
+        // Photos that exhausted all 3 job attempts without succeeding.
+        // These have no face data and will never produce matches — the admin
+        // should re-upload them.
+        const failedPhotos = await Photo.countDocuments({
+            eventId: event.code,
+            cloudinaryUrl: "upload_failed",
         });
 
         res.json({
@@ -320,6 +377,8 @@ exports.getEventById = async (req, res) => {
                 photoCount,
                 matchCount,
                 pendingProcessing,
+                activeJobs,
+                failedPhotos,
             },
         });
     } catch (error) {

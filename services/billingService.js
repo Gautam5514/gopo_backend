@@ -6,27 +6,27 @@ const Payment = require("../models/Payment");
 const DEFAULT_PLANS = [
   {
     code: "basic",
-    name: "Basic",
-    amount: 100,
+    name: "Starter",
+    amount: 99900,        // ₹999/month — minimum viable margin
     currency: "INR",
     billingCycle: "monthly",
-    uploadLimit: 500,
+    uploadLimit: 1500,
   },
   {
     code: "pro",
     name: "Pro",
-    amount: 99900,
+    amount: 299900,       // ₹2,999/month
     currency: "INR",
     billingCycle: "monthly",
-    uploadLimit: 2000,
+    uploadLimit: 6000,
   },
   {
     code: "premium",
-    name: "Premium",
-    amount: 249900,
+    name: "Studio",
+    amount: 799900,       // ₹7,999/month
     currency: "INR",
     billingCycle: "monthly",
-    uploadLimit: 10000,
+    uploadLimit: 20000,
   },
 ];
 

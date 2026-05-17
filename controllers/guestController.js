@@ -3,6 +3,7 @@ const Event = require("../models/Event");
 const cloudinaryService = require("../services/cloudinaryService");
 const faceService = require("../services/faceService");
 const emailService = require("../services/emailService");
+const { triggerMatchingForEvent } = require("../services/matchService");
 const Match = require("../models/Match");
 const DownloadLog = require("../models/DownloadLog");
 const AdmZip = require("adm-zip");
@@ -12,6 +13,39 @@ const AdmZip = require("adm-zip");
 // so that historical consent records can be matched to the exact disclosure
 // the guest accepted.
 const CONSENT_VERSION = "v1";
+
+const refreshMatchingAfterRegistration = (eventId, attempt = 1) => {
+  triggerMatchingForEvent(eventId, { resetProcessed: true })
+    .then((result) => {
+      if (result?.skipped) {
+        // Retry when matching is locked by another process (short delay) OR
+        // when photos are still uploading (longer delay so the worker has
+        // time to finish the batch and mark cloudinaryUrl on all photos).
+        // resetProcessed: true in the worker's checkAndTriggerMatching covers
+        // the common case, but retrying here is a safety-net for edge cases
+        // such as server restart between photo upload and final matching.
+        const shouldRetry =
+          (result.reason === "matching_already_running" && attempt < 5) ||
+          (result.reason === "photos_still_processing"  && attempt < 5);
+        if (shouldRetry) {
+          const delay = result.reason === "photos_still_processing" ? 20_000 : 5_000;
+          const timer = setTimeout(
+            () => refreshMatchingAfterRegistration(eventId, attempt + 1),
+            delay
+          );
+          timer.unref?.();
+        }
+        return;
+      }
+      console.log(
+        `[Guest] Matching refreshed for ${eventId}: ` +
+        `${result.matchCount} matches, ${result.notifiedGuests} guests notified`
+      );
+    })
+    .catch((matchError) => {
+      console.error("Guest registration matching refresh failed:", matchError.message);
+    });
+};
 
 exports.registerGuest = async (req, res) => {
   try {
@@ -94,7 +128,7 @@ exports.registerGuest = async (req, res) => {
           consentVersion: CONSENT_VERSION,
         },
       },
-      { upsert: true, new: false, setDefaultsOnInsert: true }
+      { upsert: true, returnDocument: "before", setDefaultsOnInsert: true }
     );
 
     const isReRegistration = beforeDoc !== null;
@@ -120,6 +154,12 @@ exports.registerGuest = async (req, res) => {
     const guestId = isReRegistration
       ? beforeDoc._id
       : (await Guest.findOne({ email: cleanEmail, eventId: cleanEventId }).select("_id").lean())?._id;
+
+    // If event photos were uploaded before this guest registered, or this is a
+    // new selfie for an existing guest, compare the current descriptor against
+    // the already-uploaded album. If photos are still processing, the worker
+    // will trigger matching when the last upload finishes.
+    refreshMatchingAfterRegistration(cleanEventId);
 
     // ── Onboarding email (best-effort, fire-and-forget) ─────────────────────
     emailService
@@ -332,20 +372,43 @@ exports.downloadAllPhotosZip = async (req, res) => {
     for (const photo of accessiblePhotos) {
       uniqueByPhotoId.set(photo._id.toString(), photo);
     }
-    const uniquePhotos = Array.from(uniqueByPhotoId.values());
+
+    // Cap at 200 photos per ZIP so the response stays within a safe RAM budget
+    // (~1 GB for 5 MB average JPEG).  Guests with more matches should download
+    // in batches using the individual-photo endpoint.
+    const ZIP_PHOTO_CAP = 200;
+    const allUnique = Array.from(uniqueByPhotoId.values());
+    if (allUnique.length > ZIP_PHOTO_CAP) {
+      return res.status(400).json({
+        error: `You have ${allUnique.length} matched photos. ZIP download is limited to ${ZIP_PHOTO_CAP} at a time. Please download photos individually or contact support.`,
+      });
+    }
+    const uniquePhotos = allUnique;
+
+    // 30 s timeout per photo fetch — prevents a single hung Cloudinary connection
+    // from stalling the entire ZIP request indefinitely.
+    const fetchWithTimeout = async (url, timeoutMs = 30_000) => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(url, { signal: controller.signal });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return Buffer.from(await response.arrayBuffer());
+      } finally {
+        clearTimeout(timer);
+      }
+    };
 
     const zip = new AdmZip();
 
-    // Fetch photos 10 at a time to avoid saturating Cloudinary's connection
-    // pool and hitting rate limits when an event has hundreds of photos.
-    const FETCH_CONCURRENCY = 10;
+    // Fetch photos 5 at a time — reduced from 10 because each fetch now buffers
+    // the full JPEG in RAM; 5 × ~5 MB = 25 MB peak per batch is comfortable.
+    const FETCH_CONCURRENCY = 5;
     for (let i = 0; i < uniquePhotos.length; i += FETCH_CONCURRENCY) {
       const batch = uniquePhotos.slice(i, i + FETCH_CONCURRENCY);
       await Promise.all(
         batch.map(async (photo, batchIdx) => {
-          const response = await fetch(photo.cloudinaryUrl);
-          if (!response.ok) throw new Error(`Failed to fetch photo ${photo._id}`);
-          const buffer    = Buffer.from(await response.arrayBuffer());
+          const buffer    = await fetchWithTimeout(photo.cloudinaryUrl);
           const extension = getFileExtension(photo.cloudinaryUrl);
           zip.addFile(`event-photo-${i + batchIdx + 1}.${extension}`, buffer);
         })
@@ -353,8 +416,12 @@ exports.downloadAllPhotosZip = async (req, res) => {
     }
 
     // Log downloads against the guestId that owns the match for accurate analytics.
-    // photoId is already confirmed accessible above so _id is always defined.
-    const matchMap = new Map(matches.map((m) => [m.photoId._id.toString(), m.guestId]));
+    // Filter out any matches where photoId was deleted (orphaned match documents).
+    const matchMap = new Map(
+        matches
+            .filter((m) => m.photoId?._id)
+            .map((m) => [m.photoId._id.toString(), m.guestId])
+    );
     await DownloadLog.insertMany(
       uniquePhotos.map((photo) => ({
         eventId:      photo.eventId,

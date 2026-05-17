@@ -12,7 +12,12 @@ const {
 const { authenticate, authorize } = require("../middleware/auth");
 const { guestRegistrationLimiter } = require("../middleware/rateLimiter");
 
-const upload = multer({ storage: multer.memoryStorage() });
+// 10 MB cap: large enough for a high-quality selfie; rejects files before any
+// application code runs so an oversized file never enters RAM or face detection.
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+});
 
 // Limiter runs before multer so excess requests are rejected without parsing
 // the multipart body or buffering the selfie image into memory.

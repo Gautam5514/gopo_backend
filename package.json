@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
+    "download-models": "node scripts/downloadModels.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -14,21 +15,18 @@
   "type": "commonjs",
   "dependencies": {
     "@sentry/node": "^10.50.0",
-    "@tensorflow/tfjs-node": "^4.22.0",
-    "@vladmandic/face-api": "^1.7.15",
     "adm-zip": "^0.5.16",
-    "bullmq": "^5.76.2",
-    "canvas": "^3.2.1",
     "cloudinary": "^2.9.0",
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "express-rate-limit": "^8.4.1",
-    "ioredis": "^5.10.1",
     "mongoose": "^9.2.1",
     "multer": "^2.1.0",
+    "onnxruntime-node": "^1.25.1",
     "razorpay": "^2.9.6",
     "resend": "^6.9.3",
+    "sharp": "^0.34.5",
     "sib-api-v3-sdk": "^8.5.0"
   },
   "devDependencies": {

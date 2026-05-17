@@ -19,7 +19,10 @@ const upload = multer({
         },
     }),
     limits: {
-        fileSize: 5 * 1024 * 1024, // 5 MB — enough for a 1600 px compressed photo
+        // 20 MB covers the largest JPEG/HEIC from modern phone cameras.
+        // The worker resizes every photo to ≤1920 px before Cloudinary upload
+        // so storage cost is independent of the raw upload size.
+        fileSize: 20 * 1024 * 1024,
         files: 300,
     },
 });

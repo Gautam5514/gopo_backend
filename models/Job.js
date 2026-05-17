@@ -18,14 +18,15 @@ const jobSchema = new mongoose.Schema(
         },
         error: String,
         attempts: { type: Number, default: 0 },
+        processingStartedAt: Date, // set when claimed; used to detect stale jobs after a crash
+        nextRetryAt: Date,         // set on failure; null/absent means "ready now"
     },
     { timestamps: true }
 );
 
-// Primary poll query: pick oldest pending job first.
-jobSchema.index({ status: 1, createdAt: 1 });
-
-// Used to count remaining jobs per event after each job completes.
+// Poll query: oldest ready-to-run pending job first
+jobSchema.index({ status: 1, nextRetryAt: 1, createdAt: 1 });
+// Count remaining jobs per event after each job completes
 jobSchema.index({ "payload.eventId": 1, status: 1 });
 
 module.exports = mongoose.model("Job", jobSchema);
