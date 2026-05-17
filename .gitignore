@@ -16,3 +16,7 @@ npm-debug.log*
 # Build / cache
 .cache/
 dist/
+
+# Downloaded model binaries
+models/buffalo_l/*.onnx
+models/buffalo_l/_buffalo_l.zip
