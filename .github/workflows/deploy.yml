@@ -18,6 +18,8 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             cd ~/gopo_backend
-            git pull origin main
-            npm install
-            pm2 restart backend
+            git fetch origin main
+            git reset --hard origin/main
+            npm ci
+            npm run download-models
+            pm2 restart backend || pm2 start index.js --name backend
