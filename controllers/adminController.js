@@ -120,7 +120,11 @@ exports.uploadPhotos = async (req, res) => {
 
 exports.startMatching = async (req, res) => {
     try {
-        const { eventId } = req.body;
+        const { eventId } = req.body || {};
+        if (!eventId) {
+            return res.status(400).json({ error: "eventId is required" });
+        }
+
         const event = await getOwnedEventByCode(req.user.userId, eventId);
         if (!event) {
             return res.status(404).json({ error: "Event not found" });
