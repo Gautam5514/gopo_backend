@@ -16,6 +16,7 @@
   "dependencies": {
     "@sentry/node": "^10.50.0",
     "adm-zip": "^0.5.16",
+    "bullmq": "^5.76.10",
     "cloudinary": "^2.9.0",
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
